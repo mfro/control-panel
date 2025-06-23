@@ -1,10 +1,9 @@
-#![windows_subsystem = "windows"]
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 use std::{
     cell::RefCell,
+    collections::HashMap,
     ffi::CString,
-    fs::File,
-    io::Write,
     ptr::null_mut,
     str::FromStr,
     sync::{Arc, Mutex},
@@ -15,7 +14,7 @@ use anyhow::{Context, Result};
 use windows::{
     self,
     Win32::{
-        Devices::FunctionDiscovery::PKEY_DeviceClass_IconPath,
+        Devices::FunctionDiscovery::{PKEY_Device_FriendlyName, PKEY_DeviceClass_IconPath},
         Foundation::{COLORREF, HINSTANCE, HWND, LPARAM, LRESULT, RECT, WPARAM},
         Graphics::{
             Gdi::{
@@ -29,13 +28,13 @@ use windows::{
             },
         },
         Media::Audio::{
-            DEVICE_STATE_ACTIVE, EDataFlow, ERole,
+            EDataFlow, ERole,
             Endpoints::{
                 IAudioEndpointVolume, IAudioEndpointVolumeCallback,
                 IAudioEndpointVolumeCallback_Impl,
             },
             IMMDevice, IMMDeviceEnumerator, IMMNotificationClient, IMMNotificationClient_Impl,
-            MMDeviceEnumerator, eAll, eCapture, eMultimedia, eRender,
+            MMDeviceEnumerator, eCapture, eMultimedia, eRender,
         },
         System::{
             Com::{CLSCTX_ALL, CoCreateInstance, CoInitialize, STGM_READ},
@@ -81,6 +80,34 @@ fn default<T: Default>() -> T {
     Default::default()
 }
 
+#[cfg(not(debug_assertions))]
+fn log_to_file(str: &str) {
+    use std::{fs::File, io::Write};
+    let mut file = File::options()
+        .write(true)
+        .append(true)
+        .create(true)
+        .open(r"E:\persistent\code\control-panel\log.txt")
+        .unwrap();
+
+    file.write_all(str.as_bytes()).unwrap();
+    file.write_all(b"\n").unwrap();
+}
+
+#[cfg(not(debug_assertions))]
+macro_rules! log {
+    ($expression:literal $(, $arg:expr)*) => {
+        crate::log_to_file(&format!($expression $(, $arg )*))
+    };
+}
+
+#[cfg(debug_assertions)]
+macro_rules! log {
+    ($expression:literal $(, $arg:expr)*) => {
+        println!($expression $(, $arg )*)
+    };
+}
+
 unsafe impl Sync for RedrawHandle {}
 unsafe impl Send for RedrawHandle {}
 
@@ -90,6 +117,10 @@ struct RedrawHandle {
 }
 
 impl RedrawHandle {
+    fn new(hwnd: HWND) -> Self {
+        Self { hwnd }
+    }
+
     fn redraw(&self) {
         unsafe {
             SendMessageA(self.hwnd, WM_KILLFOCUS, default(), default());
@@ -100,8 +131,36 @@ impl RedrawHandle {
 
 struct State {
     audio_helper: IMMDeviceEnumerator,
+    volume_callback: IAudioEndpointVolumeCallback,
+    devices: HashMap<String, IAudioEndpointVolume>,
     unlock_mute_output: bool,
     unlock_mute_input: bool,
+}
+
+impl State {
+    pub fn get_device_info(&mut self, device: &IMMDevice) -> Result<DeviceInfo> {
+        unsafe {
+            let props = device.OpenPropertyStore(STGM_READ)?;
+            let icon_path = props.GetValue(&PKEY_DeviceClass_IconPath)?.to_string();
+
+            let id = device.GetId()?.to_string()?;
+
+            if !self.devices.contains_key(&id) {
+                let name: String = props.GetValue(&PKEY_Device_FriendlyName)?.to_string();
+                log!("start tracking device: {} {}", id, name);
+
+                let volume: IAudioEndpointVolume = device.Activate(CLSCTX_ALL, None)?;
+                volume.RegisterControlChangeNotify(&self.volume_callback)?;
+
+                self.devices.insert(id.clone(), volume);
+            }
+
+            let volume = &self.devices[&id];
+            let mute = volume.GetMute()?.into();
+
+            Ok(DeviceInfo { icon_path, mute })
+        }
+    }
 }
 
 struct DeviceInfo {
@@ -132,37 +191,6 @@ fn get_icon(icon_path: &str) -> Result<HICON> {
     }
 }
 
-fn get_device_info(device: &IMMDevice) -> Result<DeviceInfo> {
-    unsafe {
-        let props = device.OpenPropertyStore(STGM_READ)?;
-
-        let volume: IAudioEndpointVolume = device.Activate(CLSCTX_ALL, None)?;
-        let mute = volume.GetMute()?.into();
-
-        let icon_path = props.GetValue(&PKEY_DeviceClass_IconPath)?.to_string();
-
-        Ok(DeviceInfo { icon_path, mute })
-    }
-}
-
-fn dump(str: &str) {
-    let mut file = File::options()
-        .write(true)
-        .append(true)
-        .create(true)
-        .open(r"E:\persistent\code\control-panel\log.txt")
-        .unwrap();
-
-    file.write_all(str.as_bytes()).unwrap();
-    file.write_all(b"\n").unwrap();
-}
-
-macro_rules! dump {
-    ($expression:literal $(, $arg:expr)*) => {
-        crate::dump(&format!($expression $(, $arg )*))
-    };
-}
-
 struct PaintHandle {
     pub hwnd: HWND,
     pub hdc: HDC,
@@ -182,24 +210,24 @@ impl Drop for PaintHandle {
         unsafe {
             let result = EndPaint(self.hwnd, &self.paint);
             if let Err(e) = result.ok() {
-                dump!("end paint error: {:?}", e);
+                log!("end paint error: {:?}", e);
             }
         }
     }
 }
 
-fn paint_window(hwnd: HWND, state: &State) -> Result<()> {
+fn paint_window(hwnd: HWND, state: &mut State) -> Result<()> {
     unsafe {
         let device = state
             .audio_helper
             .GetDefaultAudioEndpoint(eRender, eMultimedia)?;
-        let output_device = get_device_info(&device)?;
+        let output_device = state.get_device_info(&device)?;
         let output_icon = get_icon(&output_device.icon_path)?;
 
         let device = state
             .audio_helper
             .GetDefaultAudioEndpoint(eCapture, eMultimedia)?;
-        let input_device = get_device_info(&device)?;
+        let input_device = state.get_device_info(&device)?;
         let input_icon = get_icon(&input_device.icon_path)?;
 
         let mut client_rect = RECT::default();
@@ -300,14 +328,16 @@ fn on_unlock(state: &mut State) -> Result<()> {
     Ok(())
 }
 
-fn wrap(a: impl FnOnce(&mut State) -> Result<()>) {
+fn wrap(function: impl FnOnce(&mut State) -> Result<()>) {
     WINDOW_STATE.with(|state| {
         if let Some(state) = state.borrow_mut().as_mut() {
             let mut state = state.lock().unwrap();
 
-            if let Err(e) = (a)(&mut *state) {
-                dump!("error: {:?}", e);
+            if let Err(e) = (function)(&mut *state) {
+                log!("error: {:?}", e);
             }
+        } else {
+            log!("no window state");
         }
     });
 }
@@ -413,7 +443,7 @@ impl IAudioEndpointVolumeCallback_Impl for VolumeCallback_Impl {
 
 fn run() -> Result<()> {
     unsafe {
-        dump!("launch attempt");
+        log!("launch attempt");
         CoInitialize(None).ok()?;
 
         let mut token = 0;
@@ -424,12 +454,6 @@ fn run() -> Result<()> {
 
         let audio_helper: IMMDeviceEnumerator =
             CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL)?;
-
-        WINDOW_STATE.set(Some(Arc::new(Mutex::new(State {
-            audio_helper: audio_helper.clone(),
-            unlock_mute_output: false,
-            unlock_mute_input: false,
-        }))));
 
         let hinstance: HINSTANCE = GetModuleHandleA(None)?.into();
 
@@ -482,31 +506,25 @@ fn run() -> Result<()> {
 
         WTSRegisterSessionNotification(hwnd, NOTIFY_FOR_ALL_SESSIONS)?;
 
-        dump!("{:?}", hwnd);
+        log!("{:?}", hwnd);
 
-        let redraw_handle = RedrawHandle { hwnd };
+        let redraw_handle = RedrawHandle::new(hwnd);
+
+        let callback = VolumeCallback { redraw_handle };
+
+        WINDOW_STATE.set(Some(Arc::new(Mutex::new(State {
+            audio_helper: audio_helper.clone(),
+            volume_callback: callback.into(),
+            devices: HashMap::new(),
+            unlock_mute_output: false,
+            unlock_mute_input: false,
+        }))));
 
         let callback = DeviceNotificationCallback {
             redraw_handle: redraw_handle.clone(),
         };
-        let _client: IMMNotificationClient = callback.into();
-        audio_helper.RegisterEndpointNotificationCallback(&_client)?;
-
-        let devices = audio_helper.EnumAudioEndpoints(eAll, DEVICE_STATE_ACTIVE)?;
-
-        let mut cleanup = vec![];
-        for i in 0..devices.GetCount()? {
-            let device = devices.Item(i)?;
-            let volume: IAudioEndpointVolume = device.Activate(CLSCTX_ALL, None)?;
-
-            let callback = VolumeCallback {
-                redraw_handle: redraw_handle.clone(),
-            };
-            let _client: IAudioEndpointVolumeCallback = callback.into();
-            volume.RegisterControlChangeNotify(&_client)?;
-
-            cleanup.push(move || volume.UnregisterControlChangeNotify(&_client));
-        }
+        let callback: IMMNotificationClient = callback.into();
+        audio_helper.RegisterEndpointNotificationCallback(&callback)?;
 
         std::thread::spawn(move || {
             loop {
@@ -522,10 +540,7 @@ fn run() -> Result<()> {
             DispatchMessageA(&message);
         }
 
-        audio_helper.UnregisterEndpointNotificationCallback(&_client)?;
-        for cleanup in cleanup {
-            cleanup()?;
-        }
+        audio_helper.UnregisterEndpointNotificationCallback(&callback)?;
         DestroyWindow(hwnd)?;
     }
 
@@ -537,7 +552,7 @@ fn main() {
         match run() {
             Ok(()) => break,
             Err(e) => {
-                dump!("main error: {:?}", e);
+                log!("main error: {:?}", e);
                 std::thread::sleep(Duration::from_millis(500));
             }
         }
