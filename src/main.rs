@@ -3,6 +3,9 @@
 use std::{
     cell::RefCell,
     ffi::CString,
+    fs::File,
+    io::Write,
+    ptr::null_mut,
     str::FromStr,
     sync::{Arc, Mutex},
     time::Duration,
@@ -16,7 +19,7 @@ use windows::{
         Foundation::{COLORREF, HINSTANCE, HWND, LPARAM, LRESULT, RECT, WPARAM},
         Graphics::{
             Gdi::{
-                BeginPaint, CreateSolidBrush, EndPaint, FillRect, PAINTSTRUCT, RDW_INVALIDATE,
+                BeginPaint, CreateSolidBrush, EndPaint, FillRect, HDC, PAINTSTRUCT, RDW_INVALIDATE,
                 RedrawWindow,
             },
             GdiPlus::{
@@ -37,17 +40,19 @@ use windows::{
         System::{
             Com::{CLSCTX_ALL, CoCreateInstance, CoInitialize, STGM_READ},
             LibraryLoader::GetModuleHandleA,
+            RemoteDesktop::{NOTIFY_FOR_ALL_SESSIONS, WTSRegisterSessionNotification},
         },
         UI::{
             Shell::ExtractIconExA,
             WindowsAndMessaging::{
-                DefWindowProcA, DestroyWindow, DispatchMessageA, DrawIcon, GWL_EXSTYLE, GWL_STYLE,
-                GetClientRect, GetMessageA, HICON, HMENU, HWND_TOPMOST, LWA_ALPHA, MSG,
-                PostQuitMessage, RegisterClassA, SWP_NOMOVE, SWP_NOSIZE, SendMessageA,
-                SetLayeredWindowAttributes, SetWindowLongA, SetWindowPos, WINDOW_EX_STYLE,
-                WINDOW_STYLE, WM_DESTROY, WM_KILLFOCUS, WM_PAINT, WM_QUIT, WNDCLASSA,
-                WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST,
-                WS_EX_TRANSPARENT, WS_POPUP, WS_VISIBLE,
+                DefWindowProcA, DestroyIcon, DestroyWindow, DispatchMessageA, DrawIcon,
+                GWL_EXSTYLE, GWL_STYLE, GetClientRect, GetMessageA, HICON, HMENU, HWND_TOPMOST,
+                LWA_ALPHA, MSG, PostQuitMessage, RegisterClassA, SWP_NOMOVE, SWP_NOSIZE,
+                SendMessageA, SetLayeredWindowAttributes, SetWindowLongA, SetWindowPos,
+                WINDOW_EX_STYLE, WINDOW_STYLE, WM_DESTROY, WM_KILLFOCUS, WM_PAINT, WM_QUIT,
+                WM_WTSSESSION_CHANGE, WNDCLASSA, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
+                WS_EX_TOPMOST, WS_EX_TRANSPARENT, WS_POPUP, WS_VISIBLE, WTS_SESSION_LOCK,
+                WTS_SESSION_UNLOCK,
             },
         },
     },
@@ -95,6 +100,8 @@ impl RedrawHandle {
 
 struct State {
     audio_helper: IMMDeviceEnumerator,
+    unlock_mute_output: bool,
+    unlock_mute_input: bool,
 }
 
 struct DeviceInfo {
@@ -138,6 +145,173 @@ fn get_device_info(device: &IMMDevice) -> Result<DeviceInfo> {
     }
 }
 
+fn dump(str: &str) {
+    let mut file = File::options()
+        .write(true)
+        .append(true)
+        .create(true)
+        .open(r"E:\persistent\code\control-panel\log.txt")
+        .unwrap();
+
+    file.write_all(str.as_bytes()).unwrap();
+    file.write_all(b"\n").unwrap();
+}
+
+macro_rules! dump {
+    ($expression:literal $(, $arg:expr)*) => {
+        crate::dump(&format!($expression $(, $arg )*))
+    };
+}
+
+struct PaintHandle {
+    pub hwnd: HWND,
+    pub hdc: HDC,
+    pub paint: PAINTSTRUCT,
+}
+
+impl PaintHandle {
+    pub fn new(hwnd: HWND) -> Self {
+        let mut paint = PAINTSTRUCT::default();
+        let hdc = unsafe { BeginPaint(hwnd, &mut paint) };
+        Self { hwnd, hdc, paint }
+    }
+}
+
+impl Drop for PaintHandle {
+    fn drop(&mut self) {
+        unsafe {
+            let result = EndPaint(self.hwnd, &self.paint);
+            if let Err(e) = result.ok() {
+                dump!("end paint error: {:?}", e);
+            }
+        }
+    }
+}
+
+fn paint_window(hwnd: HWND, state: &State) -> Result<()> {
+    unsafe {
+        let device = state
+            .audio_helper
+            .GetDefaultAudioEndpoint(eRender, eMultimedia)?;
+        let output_device = get_device_info(&device)?;
+        let output_icon = get_icon(&output_device.icon_path)?;
+
+        let device = state
+            .audio_helper
+            .GetDefaultAudioEndpoint(eCapture, eMultimedia)?;
+        let input_device = get_device_info(&device)?;
+        let input_icon = get_icon(&input_device.icon_path)?;
+
+        let mut client_rect = RECT::default();
+        GetClientRect(hwnd, &mut client_rect)?;
+
+        let paint = PaintHandle::new(hwnd);
+
+        let hbrush = CreateSolidBrush(COLORREF(0xffffff));
+        FillRect(paint.hdc, &client_rect, hbrush);
+
+        DrawIcon(paint.hdc, 8, 8, output_icon)?;
+        DrawIcon(paint.hdc, 48, 8, input_icon)?;
+
+        let mut graphics = std::ptr::null_mut();
+        GdipCreateFromHDC(paint.hdc, &mut graphics);
+
+        let mut pen = std::ptr::null_mut();
+        GdipCreatePen1(0xffff0000, 8.0, UnitPixel, &mut pen);
+        GdipSetPenEndCap(pen, LineCapTriangle);
+        GdipSetPenStartCap(pen, LineCapTriangle);
+
+        if output_device.mute {
+            GdipDrawLine(graphics, pen, 8.0, 8.0, 40.0, 40.0);
+            GdipDrawLine(graphics, pen, 40.0, 8.0, 8.0, 40.0);
+        }
+
+        if input_device.mute {
+            GdipDrawLine(graphics, pen, 48.0, 8.0, 80.0, 40.0);
+            GdipDrawLine(graphics, pen, 80.0, 8.0, 48.0, 40.0);
+        }
+
+        GdipDeleteGraphics(graphics);
+
+        DestroyIcon(output_icon)?;
+        DestroyIcon(input_icon)?;
+    }
+
+    Ok(())
+}
+
+fn on_lock(state: &mut State) -> Result<()> {
+    unsafe {
+        let device = state
+            .audio_helper
+            .GetDefaultAudioEndpoint(eRender, eMultimedia)?;
+
+        let volume: IAudioEndpointVolume = device.Activate(CLSCTX_ALL, None)?;
+        let mute: bool = volume.GetMute()?.into();
+
+        if !mute {
+            volume.SetMute(true, null_mut())?;
+            state.unlock_mute_output = true;
+        }
+
+        let device = state
+            .audio_helper
+            .GetDefaultAudioEndpoint(eCapture, eMultimedia)?;
+
+        let volume: IAudioEndpointVolume = device.Activate(CLSCTX_ALL, None)?;
+        let mute: bool = volume.GetMute()?.into();
+
+        if !mute {
+            volume.SetMute(true, null_mut())?;
+            state.unlock_mute_input = true;
+        }
+    }
+
+    Ok(())
+}
+
+fn on_unlock(state: &mut State) -> Result<()> {
+    unsafe {
+        let device = state
+            .audio_helper
+            .GetDefaultAudioEndpoint(eRender, eMultimedia)?;
+
+        let volume: IAudioEndpointVolume = device.Activate(CLSCTX_ALL, None)?;
+        let mute = volume.GetMute()?.into();
+
+        if mute && state.unlock_mute_output {
+            volume.SetMute(false, null_mut())?;
+            state.unlock_mute_output = false;
+        }
+
+        let device = state
+            .audio_helper
+            .GetDefaultAudioEndpoint(eCapture, eMultimedia)?;
+
+        let volume: IAudioEndpointVolume = device.Activate(CLSCTX_ALL, None)?;
+        let mute = volume.GetMute()?.into();
+
+        if mute && state.unlock_mute_input {
+            volume.SetMute(false, null_mut())?;
+            state.unlock_mute_input = false;
+        }
+    }
+
+    Ok(())
+}
+
+fn wrap(a: impl FnOnce(&mut State) -> Result<()>) {
+    WINDOW_STATE.with(|state| {
+        if let Some(state) = state.borrow_mut().as_mut() {
+            let mut state = state.lock().unwrap();
+
+            if let Err(e) = (a)(&mut *state) {
+                dump!("error: {:?}", e);
+            }
+        }
+    });
+}
+
 unsafe extern "system" fn window_proc(
     hwnd: HWND,
     event: u32,
@@ -163,61 +337,14 @@ unsafe extern "system" fn window_proc(
                 .unwrap();
             }
 
-            WM_PAINT => {
-                WINDOW_STATE.with(|state| {
-                    if let Some(state) = state.borrow_mut().as_mut() {
-                        let state = state.lock().unwrap();
+            WM_PAINT => wrap(|state| paint_window(hwnd, state)),
 
-                        let device = state
-                            .audio_helper
-                            .GetDefaultAudioEndpoint(eRender, eMultimedia)
-                            .unwrap();
-                        let output_device = get_device_info(&device).unwrap();
-                        let output_icon = get_icon(&output_device.icon_path).unwrap();
+            WM_WTSSESSION_CHANGE => match wparam.0 as _ {
+                WTS_SESSION_LOCK => wrap(|state| on_lock(state)),
+                WTS_SESSION_UNLOCK => wrap(|state| on_unlock(state)),
 
-                        let device = state
-                            .audio_helper
-                            .GetDefaultAudioEndpoint(eCapture, eMultimedia)
-                            .unwrap();
-                        let input_device = get_device_info(&device).unwrap();
-                        let input_icon = get_icon(&input_device.icon_path).unwrap();
-
-                        let mut paint = PAINTSTRUCT::default();
-                        let mut client_rect = RECT::default();
-                        GetClientRect(hwnd, &mut client_rect).unwrap();
-
-                        let hdc = BeginPaint(hwnd, &mut paint);
-
-                        let hbrush = CreateSolidBrush(COLORREF(0xffffff));
-                        FillRect(hdc, &client_rect, hbrush);
-
-                        DrawIcon(hdc, 8, 8, output_icon).unwrap();
-                        DrawIcon(hdc, 48, 8, input_icon).unwrap();
-
-                        let mut graphics = std::ptr::null_mut();
-                        GdipCreateFromHDC(hdc, &mut graphics);
-
-                        let mut pen = std::ptr::null_mut();
-                        GdipCreatePen1(0xffff0000, 8.0, UnitPixel, &mut pen);
-                        GdipSetPenEndCap(pen, LineCapTriangle);
-                        GdipSetPenStartCap(pen, LineCapTriangle);
-
-                        if output_device.mute {
-                            GdipDrawLine(graphics, pen, 8.0, 8.0, 40.0, 40.0);
-                            GdipDrawLine(graphics, pen, 40.0, 8.0, 8.0, 40.0);
-                        }
-
-                        if input_device.mute {
-                            GdipDrawLine(graphics, pen, 48.0, 8.0, 80.0, 40.0);
-                            GdipDrawLine(graphics, pen, 80.0, 8.0, 48.0, 40.0);
-                        }
-
-                        GdipDeleteGraphics(graphics);
-
-                        EndPaint(hwnd, &paint).ok().unwrap();
-                    }
-                });
-            }
+                _ => {}
+            },
 
             _ => {}
         }
@@ -284,10 +411,9 @@ impl IAudioEndpointVolumeCallback_Impl for VolumeCallback_Impl {
     }
 }
 
-fn main() -> Result<()> {
-    std::thread::sleep(Duration::from_secs(10));
-
+fn run() -> Result<()> {
     unsafe {
+        dump!("launch attempt");
         CoInitialize(None).ok()?;
 
         let mut token = 0;
@@ -301,6 +427,8 @@ fn main() -> Result<()> {
 
         WINDOW_STATE.set(Some(Arc::new(Mutex::new(State {
             audio_helper: audio_helper.clone(),
+            unlock_mute_output: false,
+            unlock_mute_input: false,
         }))));
 
         let hinstance: HINSTANCE = GetModuleHandleA(None)?.into();
@@ -352,7 +480,9 @@ fn main() -> Result<()> {
         SetWindowLongA(hwnd, GWL_EXSTYLE, exstyle.0 as _);
         SetLayeredWindowAttributes(hwnd, COLORREF(0x0), 255, LWA_ALPHA)?;
 
-        println!("{:?}", hwnd);
+        WTSRegisterSessionNotification(hwnd, NOTIFY_FOR_ALL_SESSIONS)?;
+
+        dump!("{:?}", hwnd);
 
         let redraw_handle = RedrawHandle { hwnd };
 
@@ -400,4 +530,16 @@ fn main() -> Result<()> {
     }
 
     Ok(())
+}
+
+fn main() {
+    loop {
+        match run() {
+            Ok(()) => break,
+            Err(e) => {
+                dump!("main error: {:?}", e);
+                std::thread::sleep(Duration::from_millis(500));
+            }
+        }
+    }
 }
