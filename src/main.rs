@@ -1,12 +1,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 use std::{
-    cell::RefCell,
-    collections::HashMap,
-    ffi::CString,
-    ptr::null_mut,
-    str::FromStr,
-    sync::{Arc, Mutex},
+    cell::RefCell, collections::HashMap, ffi::CString, ptr::null_mut, str::FromStr, sync::Mutex,
     time::Duration,
 };
 
@@ -129,50 +124,74 @@ impl RedrawHandle {
     }
 }
 
-struct State {
-    audio_helper: IMMDeviceEnumerator,
-    volume_callback: IAudioEndpointVolumeCallback,
-    devices: HashMap<String, IAudioEndpointVolume>,
+struct Device {
+    controls: IAudioEndpointVolume,
+    icon: HICON,
+}
+
+impl Device {
+    pub fn new(controls: IAudioEndpointVolume, icon: HICON) -> Self {
+        Self { controls, icon }
+    }
+
+    pub fn is_mute(&self) -> Result<bool> {
+        let value = unsafe { self.controls.GetMute() }?;
+        Ok(value.as_bool())
+    }
+
+    pub fn set_mute(&self, value: bool) -> Result<()> {
+        unsafe {
+            self.controls.SetMute(value, null_mut())?;
+        }
+        Ok(())
+    }
+}
+
+struct AudioManager {
+    device_enumerator: IMMDeviceEnumerator,
+    controls_callback: IAudioEndpointVolumeCallback,
+    devices: HashMap<String, Device>,
     unlock_mute_output: bool,
     unlock_mute_input: bool,
 }
 
-impl State {
-    pub fn get_device_info(&mut self, device: &IMMDevice) -> Result<DeviceInfo> {
+impl AudioManager {
+    pub fn get_default_device(&self, flow: EDataFlow) -> Result<IMMDevice> {
+        unsafe {
+            let device = self
+                .device_enumerator
+                .GetDefaultAudioEndpoint(flow, eMultimedia)?;
+
+            Ok(device)
+        }
+    }
+
+    pub fn get_device(&mut self, device: &IMMDevice) -> Result<&Device> {
         unsafe {
             let props = device.OpenPropertyStore(STGM_READ)?;
-            let icon_path = props.GetValue(&PKEY_DeviceClass_IconPath)?.to_string();
 
             let id = device.GetId()?.to_string()?;
 
             if !self.devices.contains_key(&id) {
                 let name: String = props.GetValue(&PKEY_Device_FriendlyName)?.to_string();
+                let icon_path = props.GetValue(&PKEY_DeviceClass_IconPath)?.to_string();
+                let icon = load_icon(&icon_path)?;
+
                 log!("start tracking device: {} {}", id, name);
 
-                let volume: IAudioEndpointVolume = device.Activate(CLSCTX_ALL, None)?;
-                volume.RegisterControlChangeNotify(&self.volume_callback)?;
+                let controls: IAudioEndpointVolume = device.Activate(CLSCTX_ALL, None)?;
+                controls.RegisterControlChangeNotify(&self.controls_callback)?;
 
-                self.devices.insert(id.clone(), volume);
+                let info = Device::new(controls, icon);
+                self.devices.insert(id.clone(), info);
             }
 
-            let volume = &self.devices[&id];
-            let mute = volume.GetMute()?.into();
-
-            Ok(DeviceInfo { icon_path, mute })
+            Ok(&self.devices[&id])
         }
     }
 }
 
-struct DeviceInfo {
-    icon_path: String,
-    mute: bool,
-}
-
-thread_local! {
-    static WINDOW_STATE: RefCell<Option<Arc<Mutex<State>>>> = RefCell::new(None);
-}
-
-fn get_icon(icon_path: &str) -> Result<HICON> {
+fn load_icon(icon_path: &str) -> Result<HICON> {
     unsafe {
         let mut parts = icon_path.split(",");
         let path = parts.next().context("invalid icon path")?;
@@ -216,20 +235,8 @@ impl Drop for PaintHandle {
     }
 }
 
-fn paint_window(hwnd: HWND, state: &mut State) -> Result<()> {
+fn paint_window(hwnd: HWND, state: &mut AudioManager) -> Result<()> {
     unsafe {
-        let device = state
-            .audio_helper
-            .GetDefaultAudioEndpoint(eRender, eMultimedia)?;
-        let output_device = state.get_device_info(&device)?;
-        let output_icon = get_icon(&output_device.icon_path)?;
-
-        let device = state
-            .audio_helper
-            .GetDefaultAudioEndpoint(eCapture, eMultimedia)?;
-        let input_device = state.get_device_info(&device)?;
-        let input_icon = get_icon(&input_device.icon_path)?;
-
         let mut client_rect = RECT::default();
         GetClientRect(hwnd, &mut client_rect)?;
 
@@ -237,9 +244,6 @@ fn paint_window(hwnd: HWND, state: &mut State) -> Result<()> {
 
         let hbrush = CreateSolidBrush(COLORREF(0xffffff));
         FillRect(paint.hdc, &client_rect, hbrush);
-
-        DrawIcon(paint.hdc, 8, 8, output_icon)?;
-        DrawIcon(paint.hdc, 48, 8, input_icon)?;
 
         let mut graphics = std::ptr::null_mut();
         GdipCreateFromHDC(paint.hdc, &mut graphics);
@@ -249,86 +253,77 @@ fn paint_window(hwnd: HWND, state: &mut State) -> Result<()> {
         GdipSetPenEndCap(pen, LineCapTriangle);
         GdipSetPenStartCap(pen, LineCapTriangle);
 
-        if output_device.mute {
+        let output = state.get_default_device(eRender)?;
+        let output = state.get_device(&output)?;
+
+        DrawIcon(paint.hdc, 8, 8, output.icon)?;
+        if output.is_mute()? {
             GdipDrawLine(graphics, pen, 8.0, 8.0, 40.0, 40.0);
             GdipDrawLine(graphics, pen, 40.0, 8.0, 8.0, 40.0);
         }
 
-        if input_device.mute {
+        let input = state.get_default_device(eCapture)?;
+        let output = state.get_device(&input)?;
+
+        DrawIcon(paint.hdc, 48, 8, output.icon)?;
+        if output.is_mute()? {
             GdipDrawLine(graphics, pen, 48.0, 8.0, 80.0, 40.0);
             GdipDrawLine(graphics, pen, 80.0, 8.0, 48.0, 40.0);
         }
 
         GdipDeleteGraphics(graphics);
-
-        DestroyIcon(output_icon)?;
-        DestroyIcon(input_icon)?;
     }
 
     Ok(())
 }
 
-fn on_lock(state: &mut State) -> Result<()> {
-    unsafe {
-        let device = state
-            .audio_helper
-            .GetDefaultAudioEndpoint(eRender, eMultimedia)?;
+fn on_lock(state: &mut AudioManager) -> Result<()> {
+    let output = state.get_default_device(eRender)?;
+    let device = state.get_device(&output)?;
 
-        let volume: IAudioEndpointVolume = device.Activate(CLSCTX_ALL, None)?;
-        let mute: bool = volume.GetMute()?.into();
+    if !device.is_mute()? {
+        device.set_mute(true)?;
+        state.unlock_mute_output = true;
+    }
 
-        if !mute {
-            volume.SetMute(true, null_mut())?;
-            state.unlock_mute_output = true;
-        }
+    let input = state.get_default_device(eCapture)?;
+    let device = state.get_device(&input)?;
 
-        let device = state
-            .audio_helper
-            .GetDefaultAudioEndpoint(eCapture, eMultimedia)?;
-
-        let volume: IAudioEndpointVolume = device.Activate(CLSCTX_ALL, None)?;
-        let mute: bool = volume.GetMute()?.into();
-
-        if !mute {
-            volume.SetMute(true, null_mut())?;
-            state.unlock_mute_input = true;
-        }
+    if !device.is_mute()? {
+        device.set_mute(true)?;
+        state.unlock_mute_input = true;
     }
 
     Ok(())
 }
 
-fn on_unlock(state: &mut State) -> Result<()> {
-    unsafe {
-        let device = state
-            .audio_helper
-            .GetDefaultAudioEndpoint(eRender, eMultimedia)?;
+fn on_unlock(state: &mut AudioManager) -> Result<()> {
+    if state.unlock_mute_output {
+        let output = state.get_default_device(eRender)?;
+        let device = state.get_device(&output)?;
 
-        let volume: IAudioEndpointVolume = device.Activate(CLSCTX_ALL, None)?;
-        let mute = volume.GetMute()?.into();
-
-        if mute && state.unlock_mute_output {
-            volume.SetMute(false, null_mut())?;
-            state.unlock_mute_output = false;
+        if device.is_mute()? {
+            device.set_mute(false)?;
         }
 
-        let device = state
-            .audio_helper
-            .GetDefaultAudioEndpoint(eCapture, eMultimedia)?;
+        state.unlock_mute_output = false;
+    }
 
-        let volume: IAudioEndpointVolume = device.Activate(CLSCTX_ALL, None)?;
-        let mute = volume.GetMute()?.into();
+    if state.unlock_mute_input {
+        let input = state.get_default_device(eCapture)?;
+        let device = state.get_device(&input)?;
 
-        if mute && state.unlock_mute_input {
-            volume.SetMute(false, null_mut())?;
-            state.unlock_mute_input = false;
+        if device.is_mute()? {
+            device.set_mute(false)?;
         }
+
+        state.unlock_mute_input = false;
     }
 
     Ok(())
 }
 
-fn wrap(function: impl FnOnce(&mut State) -> Result<()>) {
+fn wrap(function: impl FnOnce(&mut AudioManager) -> Result<()>) {
     WINDOW_STATE.with(|state| {
         if let Some(state) = state.borrow_mut().as_mut() {
             let mut state = state.lock().unwrap();
@@ -340,6 +335,10 @@ fn wrap(function: impl FnOnce(&mut State) -> Result<()>) {
             log!("no window state");
         }
     });
+}
+
+thread_local! {
+    static WINDOW_STATE: RefCell<Option<Mutex<AudioManager>>> = RefCell::new(None);
 }
 
 unsafe extern "system" fn window_proc(
@@ -452,9 +451,6 @@ fn run() -> Result<()> {
         let mut output: windows::Win32::Graphics::GdiPlus::GdiplusStartupOutput = default();
         GdiplusStartup(&mut token, &input, &mut output);
 
-        let audio_helper: IMMDeviceEnumerator =
-            CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL)?;
-
         let hinstance: HINSTANCE = GetModuleHandleA(None)?.into();
 
         let window_class_name = s!("mfro test window class");
@@ -510,21 +506,18 @@ fn run() -> Result<()> {
 
         let redraw_handle = RedrawHandle::new(hwnd);
 
+        let device_enumerator: IMMDeviceEnumerator =
+            CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL)?;
+
         let callback = VolumeCallback { redraw_handle };
 
-        WINDOW_STATE.set(Some(Arc::new(Mutex::new(State {
-            audio_helper: audio_helper.clone(),
-            volume_callback: callback.into(),
+        WINDOW_STATE.set(Some(Mutex::new(AudioManager {
+            device_enumerator: device_enumerator.clone(),
+            controls_callback: callback.into(),
             devices: HashMap::new(),
             unlock_mute_output: false,
             unlock_mute_input: false,
-        }))));
-
-        let callback = DeviceNotificationCallback {
-            redraw_handle: redraw_handle.clone(),
-        };
-        let callback: IMMNotificationClient = callback.into();
-        audio_helper.RegisterEndpointNotificationCallback(&callback)?;
+        })));
 
         std::thread::spawn(move || {
             loop {
@@ -534,14 +527,31 @@ fn run() -> Result<()> {
             }
         });
 
+        let callback = DeviceNotificationCallback {
+            redraw_handle: redraw_handle.clone(),
+        };
+        let callback: IMMNotificationClient = callback.into();
+        device_enumerator.RegisterEndpointNotificationCallback(&callback)?;
+
         let mut message = MSG::default();
 
         while GetMessageA(&mut message, None, 0, 0).into() {
             DispatchMessageA(&message);
         }
 
-        audio_helper.UnregisterEndpointNotificationCallback(&callback)?;
+        device_enumerator.UnregisterEndpointNotificationCallback(&callback)?;
         DestroyWindow(hwnd)?;
+
+        let state = WINDOW_STATE.take().context("state missing")?;
+        let state = state.into_inner().unwrap();
+
+        for (_, device) in state.devices {
+            device
+                .controls
+                .UnregisterControlChangeNotify(&state.controls_callback)?;
+
+            DestroyIcon(device.icon)?;
+        }
     }
 
     Ok(())
