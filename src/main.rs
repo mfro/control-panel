@@ -13,8 +13,9 @@ use windows::{
         Foundation::{COLORREF, HINSTANCE, HWND, LPARAM, LRESULT, RECT, WPARAM},
         Graphics::{
             Gdi::{
-                BeginPaint, CreateSolidBrush, EndPaint, FillRect, HDC, PAINTSTRUCT, RDW_INVALIDATE,
-                RedrawWindow,
+                BeginPaint, BitBlt, CreateCompatibleBitmap, CreateCompatibleDC, DeleteDC,
+                DeleteObject, EndPaint, GetDC, HDC, InvalidateRect, PAINTSTRUCT, SRCCOPY,
+                SelectObject,
             },
             GdiPlus::{
                 GdipCreateFromHDC, GdipCreatePen1, GdipDeleteGraphics, GdipDrawLine,
@@ -119,7 +120,7 @@ impl RedrawHandle {
     fn redraw(&self) {
         unsafe {
             SendMessageA(self.hwnd, WM_KILLFOCUS, default(), default());
-            let _ = RedrawWindow(Some(self.hwnd), None, None, RDW_INVALIDATE);
+            let _ = InvalidateRect(Some(self.hwnd), None, true);
         }
     }
 }
@@ -191,6 +192,11 @@ impl AudioManager {
     }
 }
 
+struct WindowManager {
+    audio: AudioManager,
+    background: HDC,
+}
+
 fn load_icon(icon_path: &str) -> Result<HICON> {
     unsafe {
         let mut parts = icon_path.split(",");
@@ -235,95 +241,127 @@ impl Drop for PaintHandle {
     }
 }
 
-fn paint_window(hwnd: HWND, state: &mut AudioManager) -> Result<()> {
+fn paint_window(hwnd: HWND, state: &mut WindowManager) -> Result<()> {
     unsafe {
         let mut client_rect = RECT::default();
         GetClientRect(hwnd, &mut client_rect)?;
 
+        let width = client_rect.right - client_rect.left;
+        let height = client_rect.bottom - client_rect.top;
+
         let paint = PaintHandle::new(hwnd);
 
-        let hbrush = CreateSolidBrush(COLORREF(0xffffff));
-        FillRect(paint.hdc, &client_rect, hbrush);
+        let dc = CreateCompatibleDC(Some(paint.hdc));
+        let bitmap = CreateCompatibleBitmap(paint.hdc, width, height);
+        let _ = DeleteObject(SelectObject(dc, bitmap.into()));
+
+        // initialize render surface with background
+        BitBlt(
+            dc,
+            0,
+            0,
+            width,
+            height,
+            Some(state.background),
+            0,
+            0,
+            SRCCOPY,
+        )?;
 
         let mut graphics = std::ptr::null_mut();
-        GdipCreateFromHDC(paint.hdc, &mut graphics);
+        GdipCreateFromHDC(dc, &mut graphics);
 
         let mut pen = std::ptr::null_mut();
         GdipCreatePen1(0xffff0000, 8.0, UnitPixel, &mut pen);
         GdipSetPenEndCap(pen, LineCapTriangle);
         GdipSetPenStartCap(pen, LineCapTriangle);
 
-        let output = state.get_default_device(eRender)?;
-        let output = state.get_device(&output)?;
+        let output = state.audio.get_default_device(eRender)?;
+        let output = state.audio.get_device(&output)?;
 
-        DrawIcon(paint.hdc, 8, 8, output.icon)?;
+        DrawIcon(dc, 8, 8, output.icon)?;
         if output.is_mute()? {
             GdipDrawLine(graphics, pen, 8.0, 8.0, 40.0, 40.0);
             GdipDrawLine(graphics, pen, 40.0, 8.0, 8.0, 40.0);
         }
 
-        let input = state.get_default_device(eCapture)?;
-        let output = state.get_device(&input)?;
+        let input = state.audio.get_default_device(eCapture)?;
+        let input = state.audio.get_device(&input)?;
 
-        DrawIcon(paint.hdc, 48, 8, output.icon)?;
-        if output.is_mute()? {
+        DrawIcon(dc, 48, 8, input.icon)?;
+        if input.is_mute()? {
             GdipDrawLine(graphics, pen, 48.0, 8.0, 80.0, 40.0);
             GdipDrawLine(graphics, pen, 80.0, 8.0, 48.0, 40.0);
         }
 
+        BitBlt(
+            paint.hdc,
+            client_rect.left,
+            client_rect.top,
+            width,
+            height,
+            Some(dc),
+            0,
+            0,
+            SRCCOPY,
+        )?;
+
         GdipDeleteGraphics(graphics);
+
+        let _ = DeleteObject(bitmap.into());
+        let _ = DeleteDC(dc);
     }
 
     Ok(())
 }
 
-fn on_lock(state: &mut AudioManager) -> Result<()> {
-    let output = state.get_default_device(eRender)?;
-    let device = state.get_device(&output)?;
+fn on_lock(state: &mut WindowManager) -> Result<()> {
+    let output = state.audio.get_default_device(eRender)?;
+    let device = state.audio.get_device(&output)?;
 
     if !device.is_mute()? {
         device.set_mute(true)?;
-        state.unlock_mute_output = true;
+        state.audio.unlock_mute_output = true;
     }
 
-    let input = state.get_default_device(eCapture)?;
-    let device = state.get_device(&input)?;
+    let input = state.audio.get_default_device(eCapture)?;
+    let device = state.audio.get_device(&input)?;
 
     if !device.is_mute()? {
         device.set_mute(true)?;
-        state.unlock_mute_input = true;
+        state.audio.unlock_mute_input = true;
     }
 
     Ok(())
 }
 
-fn on_unlock(state: &mut AudioManager) -> Result<()> {
-    if state.unlock_mute_output {
-        let output = state.get_default_device(eRender)?;
-        let device = state.get_device(&output)?;
+fn on_unlock(state: &mut WindowManager) -> Result<()> {
+    if state.audio.unlock_mute_output {
+        let output = state.audio.get_default_device(eRender)?;
+        let device = state.audio.get_device(&output)?;
 
         if device.is_mute()? {
             device.set_mute(false)?;
         }
 
-        state.unlock_mute_output = false;
+        state.audio.unlock_mute_output = false;
     }
 
-    if state.unlock_mute_input {
-        let input = state.get_default_device(eCapture)?;
-        let device = state.get_device(&input)?;
+    if state.audio.unlock_mute_input {
+        let input = state.audio.get_default_device(eCapture)?;
+        let device = state.audio.get_device(&input)?;
 
         if device.is_mute()? {
             device.set_mute(false)?;
         }
 
-        state.unlock_mute_input = false;
+        state.audio.unlock_mute_input = false;
     }
 
     Ok(())
 }
 
-fn wrap(function: impl FnOnce(&mut AudioManager) -> Result<()>) {
+fn wrap(function: impl FnOnce(&mut WindowManager) -> Result<()>) {
     WINDOW_STATE.with(|state| {
         if let Some(state) = state.borrow_mut().as_mut() {
             let mut state = state.lock().unwrap();
@@ -338,7 +376,7 @@ fn wrap(function: impl FnOnce(&mut AudioManager) -> Result<()>) {
 }
 
 thread_local! {
-    static WINDOW_STATE: RefCell<Option<Mutex<AudioManager>>> = RefCell::new(None);
+    static WINDOW_STATE: RefCell<Option<Mutex<WindowManager>>> = RefCell::new(None);
 }
 
 unsafe extern "system" fn window_proc(
@@ -440,6 +478,36 @@ impl IAudioEndpointVolumeCallback_Impl for VolumeCallback_Impl {
     }
 }
 
+fn capture_background(hwnd: HWND) -> Result<HDC> {
+    unsafe {
+        let hdc = GetDC(Some(hwnd));
+        let mut client_rect = RECT::default();
+        GetClientRect(hwnd, &mut client_rect)?;
+
+        let width = client_rect.right - client_rect.left;
+        let height = client_rect.bottom - client_rect.top;
+
+        let background_dc = CreateCompatibleDC(Some(hdc));
+
+        let bitmap = CreateCompatibleBitmap(hdc, width, height);
+        SelectObject(background_dc, bitmap.into());
+
+        BitBlt(
+            background_dc,
+            0,
+            0,
+            width,
+            height,
+            Some(hdc),
+            client_rect.left,
+            client_rect.top,
+            SRCCOPY,
+        )?;
+
+        Ok(background_dc)
+    }
+}
+
 fn run() -> Result<()> {
     unsafe {
         log!("launch attempt");
@@ -502,6 +570,8 @@ fn run() -> Result<()> {
 
         WTSRegisterSessionNotification(hwnd, NOTIFY_FOR_ALL_SESSIONS)?;
 
+        let background = capture_background(hwnd)?;
+
         log!("{:?}", hwnd);
 
         let redraw_handle = RedrawHandle::new(hwnd);
@@ -511,12 +581,15 @@ fn run() -> Result<()> {
 
         let callback = VolumeCallback { redraw_handle };
 
-        WINDOW_STATE.set(Some(Mutex::new(AudioManager {
-            device_enumerator: device_enumerator.clone(),
-            controls_callback: callback.into(),
-            devices: HashMap::new(),
-            unlock_mute_output: false,
-            unlock_mute_input: false,
+        WINDOW_STATE.set(Some(Mutex::new(WindowManager {
+            audio: AudioManager {
+                device_enumerator: device_enumerator.clone(),
+                controls_callback: callback.into(),
+                devices: HashMap::new(),
+                unlock_mute_output: false,
+                unlock_mute_input: false,
+            },
+            background,
         })));
 
         std::thread::spawn(move || {
@@ -545,10 +618,10 @@ fn run() -> Result<()> {
         let state = WINDOW_STATE.take().context("state missing")?;
         let state = state.into_inner().unwrap();
 
-        for (_, device) in state.devices {
+        for (_, device) in state.audio.devices {
             device
                 .controls
-                .UnregisterControlChangeNotify(&state.controls_callback)?;
+                .UnregisterControlChangeNotify(&state.audio.controls_callback)?;
 
             DestroyIcon(device.icon)?;
         }
