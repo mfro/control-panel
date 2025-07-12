@@ -5,17 +5,16 @@ use std::{
     time::Duration,
 };
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use windows::{
     self,
     Win32::{
         Devices::FunctionDiscovery::{PKEY_Device_FriendlyName, PKEY_DeviceClass_IconPath},
-        Foundation::{COLORREF, HINSTANCE, HWND, LPARAM, LRESULT, RECT, SIZE, WPARAM},
+        Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, RECT, SIZE, WPARAM},
         Graphics::{
             Gdi::{
                 AC_SRC_ALPHA, AC_SRC_OVER, BLENDFUNCTION, CreateCompatibleBitmap,
-                CreateCompatibleDC, CreateSolidBrush, DeleteDC, DeleteObject, GetDC,
-                InvalidateRect, SelectObject,
+                CreateCompatibleDC, DeleteDC, DeleteObject, GetDC, InvalidateRect, SelectObject,
             },
             GdiPlus::{
                 GdipCreateFromHDC, GdipCreatePen1, GdipDrawLine, GdipSetPenEndCap,
@@ -42,9 +41,9 @@ use windows::{
             WindowsAndMessaging::{
                 DefWindowProcA, DestroyIcon, DestroyWindow, DispatchMessageA, DrawIcon,
                 GetMessageA, GetWindowRect, HICON, HMENU, HWND_DESKTOP, HWND_TOPMOST, MSG,
-                PostQuitMessage, RegisterClassExA, SWP_NOMOVE, SWP_NOSIZE, SendMessageA,
+                PostQuitMessage, RegisterClassA, SWP_NOMOVE, SWP_NOSIZE, SendMessageA,
                 SetWindowPos, ULW_ALPHA, UpdateLayeredWindow, WINDOW_EX_STYLE, WINDOW_STYLE,
-                WM_DESTROY, WM_KILLFOCUS, WM_PAINT, WM_QUIT, WM_WTSSESSION_CHANGE, WNDCLASSEXA,
+                WM_DESTROY, WM_KILLFOCUS, WM_PAINT, WM_QUIT, WM_WTSSESSION_CHANGE, WNDCLASSA,
                 WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOPMOST, WS_EX_TRANSPARENT, WS_POPUP,
                 WS_VISIBLE, WTS_SESSION_LOCK, WTS_SESSION_UNLOCK,
             },
@@ -463,7 +462,7 @@ impl IAudioEndpointVolumeCallback_Impl for VolumeCallback_Impl {
     }
 }
 
-fn initialize_gdp() {
+fn initialize_gdip() {
     let mut token = 0;
     let mut input = GdiplusStartupInput::default();
     input.GdiplusVersion = 1;
@@ -475,25 +474,22 @@ fn create_window() -> Result<HWND> {
     unsafe {
         let hinstance: HINSTANCE = GetModuleHandleA(None)?.into();
 
-        let window_class_name = s!("mfro test window class");
+        let window_class_name = s!("mfro window class");
 
-        let mut wc = WNDCLASSEXA::default();
-        wc.cbSize = std::mem::size_of::<WNDCLASSEXA>() as _;
-        wc.lpfnWndProc = Some(window_proc);
+        let mut wc = WNDCLASSA::default();
         wc.hInstance = hinstance;
+        wc.lpfnWndProc = Some(window_proc);
         wc.lpszClassName = window_class_name;
-        wc.hbrBackground = CreateSolidBrush(COLORREF(0xff0000ff));
 
-        RegisterClassExA(&wc);
-
-        let style = WS_POPUP | WS_VISIBLE;
-        let exstyle = WS_EX_LAYERED | WS_EX_NOACTIVATE | WS_EX_TOPMOST | WS_EX_TRANSPARENT;
+        if 0 == RegisterClassA(&wc) {
+            bail!("failed to register window class")
+        }
 
         let hwnd = CreateWindowExA(
-            exstyle,
+            WS_EX_LAYERED | WS_EX_NOACTIVATE | WS_EX_TOPMOST | WS_EX_TRANSPARENT,
             window_class_name,
-            s!("test name 2"),
-            style,
+            s!("mfro window name"),
+            WS_POPUP | WS_VISIBLE,
             -800,
             1415,
             600,
@@ -512,7 +508,7 @@ fn run() -> Result<()> {
     unsafe {
         log!("launch attempt");
         CoInitialize(None).ok()?;
-        initialize_gdp();
+        initialize_gdip();
 
         let hwnd = create_window()?;
 
@@ -527,9 +523,9 @@ fn run() -> Result<()> {
 
         std::thread::spawn(move || {
             loop {
-                std::thread::sleep(Duration::from_secs(30));
-
                 redraw_handle.redraw();
+
+                std::thread::sleep(Duration::from_secs(30));
             }
         });
 
@@ -540,8 +536,6 @@ fn run() -> Result<()> {
         audio_manager
             .device_enumerator
             .RegisterEndpointNotificationCallback(&callback)?;
-
-        redraw_handle.redraw();
 
         let mut message = MSG::default();
 
