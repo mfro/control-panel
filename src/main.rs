@@ -191,7 +191,7 @@ impl AudioManager {
             if !self.devices.contains_key(&id) {
                 let name: String = props.GetValue(&PKEY_Device_FriendlyName)?.to_string();
                 let icon_path = props.GetValue(&PKEY_DeviceClass_IconPath)?.to_string();
-                let icon = load_icon(&icon_path)?;
+                let icon = load_icon(&icon_path).context(icon_path)?;
 
                 log!("start tracking device: {} {}", id, name);
 
@@ -211,7 +211,11 @@ fn load_icon(icon_path: &str) -> Result<HICON> {
     unsafe {
         let mut parts = icon_path.split(",");
         let path = parts.next().context("invalid icon path")?;
-        let index = parts.next().context("invalid icon path")?.parse()?;
+
+        let index = match parts.next() {
+            Some(i) => i.parse()?,
+            None => 0,
+        };
 
         let mut icon = default();
         ExtractIconExA(
