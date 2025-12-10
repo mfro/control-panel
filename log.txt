@@ -1,3 +1,0 @@
-launch attempt
-start tracking device: {0.0.0.00000000}.{2b32d6ca-aea8-4697-b828-64b4cd31efcb} Headphones (max's airpods)
-start tracking device: {0.0.1.00000000}.{49bb972a-8762-43ce-a947-3a5802f66757} yeti (Yeti Classic)
