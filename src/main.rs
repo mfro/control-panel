@@ -51,14 +51,16 @@ use windows::{
                 SendMessageA, SetWindowPos, ULW_ALPHA, UpdateLayeredWindow, WINDOW_EX_STYLE,
                 WINDOW_STYLE, WM_DESTROY, WM_KILLFOCUS, WM_LBUTTONDOWN, WM_PAINT, WM_QUIT,
                 WM_WINDOWPOSCHANGING, WM_WTSSESSION_CHANGE, WNDCLASSA, WS_EX_LAYERED,
-                WS_EX_NOACTIVATE, WS_EX_TOPMOST, WS_POPUP, WS_VISIBLE,
-                WTS_SESSION_LOCK, WTS_SESSION_UNLOCK,
+                WS_EX_NOACTIVATE, WS_EX_TOPMOST, WS_POPUP, WS_VISIBLE, WTS_SESSION_LOCK,
+                WTS_SESSION_UNLOCK,
             },
         },
     },
     core::implement,
 };
-use windows_core::{PCSTR, s, w};
+use windows_core::{PCSTR, PCWSTR, s, w};
+
+const AIRPODS_AUDIO_DEVICE: PCWSTR = w!("{0.0.0.00000000}.{2b32d6ca-aea8-4697-b828-64b4cd31efcb}");
 
 windows_link::link!(
     "user32.dll" "system"
@@ -155,7 +157,10 @@ impl AudioDevice {
 
 struct AudioManager {
     device_enumerator: IMMDeviceEnumerator,
+
+    device_callback: IMMNotificationClient,
     controls_callback: IAudioEndpointVolumeCallback,
+
     devices: HashMap<String, AudioDevice>,
     unlock_mute_output: bool,
     unlock_mute_input: bool,
@@ -167,11 +172,17 @@ impl AudioManager {
             let device_enumerator: IMMDeviceEnumerator =
                 CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL)?;
 
-            let callback = VolumeCallback { redraw_handle };
+            let callback = DeviceCallback { redraw_handle };
+            let device_callback = callback.into();
+            device_enumerator.RegisterEndpointNotificationCallback(&device_callback)?;
+
+            let controls_callback = VolumeCallback { redraw_handle };
+            let controls_callback = controls_callback.into();
 
             Ok(Self {
                 device_enumerator,
-                controls_callback: callback.into(),
+                controls_callback,
+                device_callback,
                 devices: HashMap::new(),
                 unlock_mute_output: false,
                 unlock_mute_input: false,
@@ -212,6 +223,23 @@ impl AudioManager {
             Ok(&self.devices[&id])
         }
     }
+
+    pub fn destroy(self) -> Result<()> {
+        unsafe {
+            self.device_enumerator
+                .UnregisterEndpointNotificationCallback(&self.device_callback)?;
+
+            for (_, device) in self.devices {
+                device
+                    .controls
+                    .UnregisterControlChangeNotify(&self.controls_callback)?;
+
+                DestroyIcon(device.icon)?;
+            }
+        }
+
+        Ok(())
+    }
 }
 
 fn load_icon(icon_path: &str) -> Result<HICON> {
@@ -237,11 +265,11 @@ fn load_icon(icon_path: &str) -> Result<HICON> {
     }
 }
 
-struct WindowManager {
+struct WindowHelper {
     audio: AudioManager,
 }
 
-impl WindowManager {
+impl WindowHelper {
     fn on_paint(&mut self, hwnd: HWND) -> Result<()> {
         unsafe {
             let mut window_rect = RECT::default();
@@ -357,12 +385,10 @@ impl WindowManager {
 
     fn connect_airpods(&mut self) -> Result<()> {
         unsafe {
-            let airpods_audio_device =
-                w!("{0.0.0.00000000}.{2b32d6ca-aea8-4697-b828-64b4cd31efcb}");
             let airpods_audio_device = self
                 .audio
                 .device_enumerator
-                .GetDevice(airpods_audio_device)?;
+                .GetDevice(AIRPODS_AUDIO_DEVICE)?;
             let topology: IDeviceTopology = airpods_audio_device.Activate(CLSCTX_ALL, None)?;
             assert_eq!(1, topology.GetConnectorCount()?);
             let connector = topology.GetConnector(0)?;
@@ -398,8 +424,8 @@ impl WindowManager {
     }
 }
 
-fn wrap(function: impl FnOnce(&mut WindowManager) -> Result<()>) {
-    WINDOW_STATE.with(|state| {
+fn wrap(function: impl FnOnce(&mut WindowHelper) -> Result<()>) {
+    WINDOW_HELPER.with(|state| {
         if let Some(state) = state.borrow_mut().as_mut() {
             let mut state = state.lock().unwrap();
 
@@ -410,10 +436,6 @@ fn wrap(function: impl FnOnce(&mut WindowManager) -> Result<()>) {
             log!("no window state");
         }
     });
-}
-
-thread_local! {
-    static WINDOW_STATE: RefCell<Option<Mutex<WindowManager>>> = RefCell::new(None);
 }
 
 fn message_name(event: u32) -> &'static str {
@@ -623,6 +645,10 @@ fn message_name(event: u32) -> &'static str {
     }
 }
 
+thread_local! {
+    static WINDOW_HELPER: RefCell<Option<Mutex<WindowHelper>>> = RefCell::new(None);
+}
+
 unsafe extern "system" fn window_proc(
     hwnd: HWND,
     event: u32,
@@ -674,11 +700,11 @@ unsafe extern "system" fn window_proc(
 }
 
 #[implement(IMMNotificationClient)]
-struct DeviceNotificationCallback {
+struct DeviceCallback {
     redraw_handle: RedrawHandle,
 }
 
-impl IMMNotificationClient_Impl for DeviceNotificationCallback_Impl {
+impl IMMNotificationClient_Impl for DeviceCallback_Impl {
     fn OnDeviceStateChanged(
         &self,
         _pwstrdeviceid: &windows_core::PCWSTR,
@@ -782,20 +808,13 @@ fn run() -> Result<()> {
 
         let hwnd = create_window()?;
 
+        // register for WM_WTSSESSION_CHANGE events
         WTSRegisterSessionNotification(hwnd, NOTIFY_FOR_ALL_SESSIONS)?;
 
         let redraw_handle = RedrawHandle::new(hwnd);
         let audio_manager = AudioManager::new(redraw_handle)?;
 
-        let callback = DeviceNotificationCallback {
-            redraw_handle: redraw_handle.clone(),
-        };
-        let callback: IMMNotificationClient = callback.into();
-        audio_manager
-            .device_enumerator
-            .RegisterEndpointNotificationCallback(&callback)?;
-
-        WINDOW_STATE.set(Some(Mutex::new(WindowManager {
+        WINDOW_HELPER.set(Some(Mutex::new(WindowHelper {
             audio: audio_manager,
         })));
 
@@ -813,21 +832,10 @@ fn run() -> Result<()> {
             DispatchMessageA(&message);
         }
 
-        let state = WINDOW_STATE.take().context("state missing")?;
+        let state = WINDOW_HELPER.take().context("state missing")?;
         let state = state.into_inner().unwrap();
 
-        state
-            .audio
-            .device_enumerator
-            .UnregisterEndpointNotificationCallback(&callback)?;
-
-        for (_, device) in state.audio.devices {
-            device
-                .controls
-                .UnregisterControlChangeNotify(&state.audio.controls_callback)?;
-
-            DestroyIcon(device.icon)?;
-        }
+        state.audio.destroy()?;
 
         DestroyWindow(hwnd)?;
     }
