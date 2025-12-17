@@ -10,7 +10,7 @@ use windows::{
     self,
     Win32::{
         Devices::FunctionDiscovery::{PKEY_Device_FriendlyName, PKEY_DeviceClass_IconPath},
-        Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, RECT, SIZE, WPARAM},
+        Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, PROPERTYKEY, RECT, SIZE, WPARAM},
         Graphics::{
             Gdi::{
                 AC_SRC_ALPHA, AC_SRC_OVER, BLENDFUNCTION, CreateCompatibleBitmap,
@@ -24,13 +24,14 @@ use windows::{
         },
         Media::{
             Audio::{
-                EDataFlow, ERole,
+                DEVICE_STATE, DEVICE_STATE_ACTIVE, EDataFlow, ERole,
                 Endpoints::{
                     IAudioEndpointVolume, IAudioEndpointVolumeCallback,
                     IAudioEndpointVolumeCallback_Impl,
                 },
                 IDeviceTopology, IMMDevice, IMMDeviceEnumerator, IMMNotificationClient,
-                IMMNotificationClient_Impl, MMDeviceEnumerator, eCapture, eMultimedia, eRender,
+                IMMNotificationClient_Impl, MMDeviceEnumerator, eCapture, eCommunications,
+                eConsole, eMultimedia, eRender,
             },
             KernelStreaming::{
                 IKsControl, KSIDENTIFIER, KSIDENTIFIER_0, KSPROPERTY_ONESHOT_RECONNECT,
@@ -46,10 +47,10 @@ use windows::{
             Shell::ExtractIconExA,
             WindowsAndMessaging::{
                 DefWindowProcA, DestroyIcon, DestroyWindow, DispatchMessageA, DrawIcon,
-                GetMessageA, GetWindowRect, HICON, HMENU, HWND_DESKTOP, HWND_TOPMOST, IDC_ARROW,
+                GetMessageA, GetWindowRect, HICON, HWND_DESKTOP, HWND_TOPMOST, IDC_ARROW,
                 LoadCursorW, MSG, PostQuitMessage, RegisterClassA, SWP_NOMOVE, SWP_NOSIZE,
-                SendMessageA, SetWindowPos, ULW_ALPHA, UpdateLayeredWindow, WINDOW_EX_STYLE,
-                WINDOW_STYLE, WM_DESTROY, WM_KILLFOCUS, WM_LBUTTONDOWN, WM_PAINT, WM_QUIT,
+                SendMessageA, SetWindowPos, ULW_ALPHA, UpdateLayeredWindow, WM_DESTROY,
+                WM_DEVICECHANGE, WM_KILLFOCUS, WM_LBUTTONDOWN, WM_PAINT, WM_QUIT,
                 WM_WINDOWPOSCHANGING, WM_WTSSESSION_CHANGE, WNDCLASSA, WS_EX_LAYERED,
                 WS_EX_NOACTIVATE, WS_EX_TOPMOST, WS_POPUP, WS_VISIBLE, WTS_SESSION_LOCK,
                 WTS_SESSION_UNLOCK,
@@ -60,24 +61,10 @@ use windows::{
 };
 use windows_core::{PCSTR, PCWSTR, s, w};
 
-const AIRPODS_AUDIO_DEVICE: PCWSTR = w!("{0.0.0.00000000}.{2b32d6ca-aea8-4697-b828-64b4cd31efcb}");
+mod interop;
+use interop::*;
 
-windows_link::link!(
-    "user32.dll" "system"
-    fn CreateWindowExA(
-        dwexstyle: WINDOW_EX_STYLE,
-        lpclassname: windows_core::PCSTR,
-        lpwindowname: windows_core::PCSTR,
-        dwstyle: WINDOW_STYLE,
-        x: i32,
-        y: i32,
-        nwidth: i32,
-        nheight: i32,
-        hwndparent: HWND,
-        hmenu: HMENU,
-        hinstance: HINSTANCE,
-        lpparam: *const core::ffi::c_void) -> HWND
-);
+const AIRPODS_AUDIO_DEVICE: PCWSTR = w!("{0.0.0.00000000}.{2b32d6ca-aea8-4697-b828-64b4cd31efcb}");
 
 fn default<T: Default>() -> T {
     Default::default()
@@ -156,6 +143,7 @@ impl AudioDevice {
 }
 
 struct AudioManager {
+    policy_config: IPolicyConfig,
     device_enumerator: IMMDeviceEnumerator,
 
     device_callback: IMMNotificationClient,
@@ -169,6 +157,9 @@ struct AudioManager {
 impl AudioManager {
     fn new(redraw_handle: RedrawHandle) -> Result<Self> {
         unsafe {
+            let policy_config: IPolicyConfig =
+                CoCreateInstance(&CLSID_PolicyConfigClient, None, CLSCTX_ALL)?;
+
             let device_enumerator: IMMDeviceEnumerator =
                 CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL)?;
 
@@ -181,6 +172,7 @@ impl AudioManager {
 
             Ok(Self {
                 device_enumerator,
+                policy_config,
                 controls_callback,
                 device_callback,
                 devices: HashMap::new(),
@@ -267,6 +259,7 @@ fn load_icon(icon_path: &str) -> Result<HICON> {
 
 struct WindowHelper {
     audio: AudioManager,
+    airpods_available: bool,
 }
 
 impl WindowHelper {
@@ -418,6 +411,48 @@ impl WindowHelper {
                 0,
                 &mut out,
             )?;
+        }
+
+        Ok(())
+    }
+
+    fn set_default_device(&mut self, device_id: PCWSTR) -> Result<()> {
+        let device_id = device_id.as_ptr();
+
+        unsafe {
+            self.audio
+                .policy_config
+                .SetDefaultEndpoint(device_id, eConsole.0 as _)
+                .ok()?;
+            self.audio
+                .policy_config
+                .SetDefaultEndpoint(device_id, eMultimedia.0 as _)
+                .ok()?;
+            self.audio
+                .policy_config
+                .SetDefaultEndpoint(device_id, eCommunications.0 as _)
+                .ok()?;
+
+            Ok(())
+        }
+    }
+
+    fn update_devices(&mut self) -> Result<()> {
+        unsafe {
+            let device = self
+                .audio
+                .device_enumerator
+                .GetDevice(AIRPODS_AUDIO_DEVICE)?;
+
+            let state = device.GetState()?;
+
+            let airpods_available = state == DEVICE_STATE_ACTIVE;
+
+            if airpods_available && !self.airpods_available {
+                self.set_default_device(AIRPODS_AUDIO_DEVICE)?;
+            }
+
+            self.airpods_available = airpods_available;
         }
 
         Ok(())
@@ -689,6 +724,10 @@ unsafe extern "system" fn window_proc(
                 wrap(|state| state.connect_airpods());
             }
 
+            WM_DEVICECHANGE => {
+                wrap(|state| state.update_devices());
+            }
+
             _ => {
                 #[cfg(debug_assertions)]
                 println!("event: {:x} {}", event, message_name(event));
@@ -707,17 +746,17 @@ struct DeviceCallback {
 impl IMMNotificationClient_Impl for DeviceCallback_Impl {
     fn OnDeviceStateChanged(
         &self,
-        _pwstrdeviceid: &windows_core::PCWSTR,
-        _dwnewstate: windows::Win32::Media::Audio::DEVICE_STATE,
+        _pwstrdeviceid: &PCWSTR,
+        _dwnewstate: DEVICE_STATE,
     ) -> windows_core::Result<()> {
         Ok(())
     }
 
-    fn OnDeviceAdded(&self, _pwstrdeviceid: &windows_core::PCWSTR) -> windows_core::Result<()> {
+    fn OnDeviceAdded(&self, _pwstrdeviceid: &PCWSTR) -> windows_core::Result<()> {
         Ok(())
     }
 
-    fn OnDeviceRemoved(&self, _pwstrdeviceid: &windows_core::PCWSTR) -> windows_core::Result<()> {
+    fn OnDeviceRemoved(&self, _pwstrdeviceid: &PCWSTR) -> windows_core::Result<()> {
         Ok(())
     }
 
@@ -725,7 +764,7 @@ impl IMMNotificationClient_Impl for DeviceCallback_Impl {
         &self,
         _flow: EDataFlow,
         _role: ERole,
-        _pwstrdefaultdeviceid: &windows_core::PCWSTR,
+        _pwstrdefaultdeviceid: &PCWSTR,
     ) -> windows_core::Result<()> {
         self.redraw_handle.redraw();
 
@@ -734,8 +773,8 @@ impl IMMNotificationClient_Impl for DeviceCallback_Impl {
 
     fn OnPropertyValueChanged(
         &self,
-        _pwstrdeviceid: &windows_core::PCWSTR,
-        _key: &windows::Win32::Foundation::PROPERTYKEY,
+        _pwstrdeviceid: &PCWSTR,
+        _key: &PROPERTYKEY,
     ) -> windows_core::Result<()> {
         Ok(())
     }
@@ -816,6 +855,7 @@ fn run() -> Result<()> {
 
         WINDOW_HELPER.set(Some(Mutex::new(WindowHelper {
             audio: audio_manager,
+            airpods_available: false,
         })));
 
         std::thread::spawn(move || {
