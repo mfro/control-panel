@@ -23,14 +23,9 @@ windows_link::link!(
         lpparam: *const core::ffi::c_void) -> HWND
 );
 
-// 870AF99C-171D-4F9E-AF0D-E63DF40C2BC9
 #[allow(non_upper_case_globals)]
-pub const CLSID_PolicyConfigClient: GUID = GUID {
-    data1: 0x870AF99C,
-    data2: 0x171D,
-    data3: 0x4F9E,
-    data4: [0xAF, 0x0D, 0xE6, 0x3D, 0xF4, 0x0C, 0x2B, 0xC9],
-};
+
+pub const CLSID_PolicyConfigClient: GUID = GUID::from_u128(0x870af99c_171d_4f9e_af0d_e63df40c2bc9);
 
 #[interface("F8679F50-850A-41CF-9C72-430F290290C8")]
 pub unsafe trait IPolicyConfig: IUnknown {

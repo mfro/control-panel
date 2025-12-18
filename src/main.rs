@@ -150,8 +150,6 @@ struct AudioManager {
     controls_callback: IAudioEndpointVolumeCallback,
 
     devices: HashMap<String, AudioDevice>,
-    unlock_mute_output: bool,
-    unlock_mute_input: bool,
 }
 
 impl AudioManager {
@@ -176,8 +174,6 @@ impl AudioManager {
                 controls_callback,
                 device_callback,
                 devices: HashMap::new(),
-                unlock_mute_output: false,
-                unlock_mute_input: false,
             })
         }
     }
@@ -189,6 +185,24 @@ impl AudioManager {
                 .GetDefaultAudioEndpoint(flow, eMultimedia)?;
 
             Ok(device)
+        }
+    }
+
+    pub fn set_default_device(&mut self, device_id: PCWSTR) -> Result<()> {
+        let device_id = device_id.as_ptr();
+
+        unsafe {
+            self.policy_config
+                .SetDefaultEndpoint(device_id, eConsole.0 as _)
+                .ok()?;
+            self.policy_config
+                .SetDefaultEndpoint(device_id, eMultimedia.0 as _)
+                .ok()?;
+            self.policy_config
+                .SetDefaultEndpoint(device_id, eCommunications.0 as _)
+                .ok()?;
+
+            Ok(())
         }
     }
 
@@ -259,7 +273,10 @@ fn load_icon(icon_path: &str) -> Result<HICON> {
 
 struct WindowHelper {
     audio: AudioManager,
+
     airpods_available: bool,
+    unlock_mute_output: bool,
+    unlock_mute_input: bool,
 }
 
 impl WindowHelper {
@@ -336,7 +353,7 @@ impl WindowHelper {
 
         if !device.is_mute()? {
             device.set_mute(true)?;
-            self.audio.unlock_mute_output = true;
+            self.unlock_mute_output = true;
         }
 
         let input = self.audio.get_default_device(eCapture)?;
@@ -344,14 +361,14 @@ impl WindowHelper {
 
         if !device.is_mute()? {
             device.set_mute(true)?;
-            self.audio.unlock_mute_input = true;
+            self.unlock_mute_input = true;
         }
 
         Ok(())
     }
 
     fn on_unlock(&mut self) -> Result<()> {
-        if self.audio.unlock_mute_output {
+        if self.unlock_mute_output {
             let output = self.audio.get_default_device(eRender)?;
             let device = self.audio.get_device(&output)?;
 
@@ -359,10 +376,10 @@ impl WindowHelper {
                 device.set_mute(false)?;
             }
 
-            self.audio.unlock_mute_output = false;
+            self.unlock_mute_output = false;
         }
 
-        if self.audio.unlock_mute_input {
+        if self.unlock_mute_input {
             let input = self.audio.get_default_device(eCapture)?;
             let device = self.audio.get_device(&input)?;
 
@@ -370,7 +387,7 @@ impl WindowHelper {
                 device.set_mute(false)?;
             }
 
-            self.audio.unlock_mute_input = false;
+            self.unlock_mute_input = false;
         }
 
         Ok(())
@@ -416,27 +433,6 @@ impl WindowHelper {
         Ok(())
     }
 
-    fn set_default_device(&mut self, device_id: PCWSTR) -> Result<()> {
-        let device_id = device_id.as_ptr();
-
-        unsafe {
-            self.audio
-                .policy_config
-                .SetDefaultEndpoint(device_id, eConsole.0 as _)
-                .ok()?;
-            self.audio
-                .policy_config
-                .SetDefaultEndpoint(device_id, eMultimedia.0 as _)
-                .ok()?;
-            self.audio
-                .policy_config
-                .SetDefaultEndpoint(device_id, eCommunications.0 as _)
-                .ok()?;
-
-            Ok(())
-        }
-    }
-
     fn update_devices(&mut self) -> Result<()> {
         unsafe {
             let device = self
@@ -449,7 +445,7 @@ impl WindowHelper {
             let airpods_available = state == DEVICE_STATE_ACTIVE;
 
             if airpods_available && !self.airpods_available {
-                self.set_default_device(AIRPODS_AUDIO_DEVICE)?;
+                self.audio.set_default_device(AIRPODS_AUDIO_DEVICE)?;
             }
 
             self.airpods_available = airpods_available;
@@ -856,6 +852,8 @@ fn run() -> Result<()> {
         WINDOW_HELPER.set(Some(Mutex::new(WindowHelper {
             audio: audio_manager,
             airpods_available: false,
+            unlock_mute_input: false,
+            unlock_mute_output: false,
         })));
 
         std::thread::spawn(move || {
