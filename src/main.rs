@@ -24,7 +24,7 @@ use windows::{
         },
         Media::{
             Audio::{
-                DEVICE_STATE, DEVICE_STATE_ACTIVE, DEVICE_STATEMASK_ALL, EDataFlow, ERole,
+                DEVICE_STATE, DEVICE_STATEMASK_ALL, EDataFlow, ERole,
                 Endpoints::{
                     IAudioEndpointVolume, IAudioEndpointVolumeCallback,
                     IAudioEndpointVolumeCallback_Impl,
@@ -59,12 +59,10 @@ use windows::{
     },
     core::implement,
 };
-use windows_core::{PCSTR, PCWSTR, s, w};
+use windows_core::{PCSTR, PCWSTR, s};
 
 mod interop;
 use interop::*;
-
-const AIRPODS_AUDIO_DEVICE: PCWSTR = w!("{0.0.0.00000000}.{2b32d6ca-aea8-4697-b828-64b4cd31efcb}");
 
 fn default<T: Default>() -> T {
     Default::default()
@@ -279,6 +277,15 @@ struct WindowHelper {
     unlock_mute_input: bool,
 }
 
+fn get_name(device: &IMMDevice) -> Result<String> {
+    unsafe {
+        let props = device.OpenPropertyStore(STGM_READ)?;
+        let name = props.GetValue(&PKEY_Device_FriendlyName)?.to_string();
+
+        Ok(name)
+    }
+}
+
 impl WindowHelper {
     fn on_paint(&mut self, hwnd: HWND) -> Result<()> {
         unsafe {
@@ -393,6 +400,27 @@ impl WindowHelper {
         Ok(())
     }
 
+    fn find_connected_airpods(&mut self) -> Result<Option<IMMDevice>> {
+        unsafe {
+            let devices = self
+                .audio
+                .device_enumerator
+                .EnumAudioEndpoints(eRender, DEVICE_STATE(DEVICE_STATEMASK_ALL))?;
+
+            for i in 0..devices.GetCount()? {
+                let device = devices.Item(i)?;
+
+                if let Ok(name) = get_name(&device)
+                    && name.to_lowercase().contains("airpods")
+                {
+                    return Ok(Some(device));
+                }
+            }
+
+            Ok(None)
+        }
+    }
+
     fn connect_airpods(&mut self) -> Result<()> {
         unsafe {
             let devices = self
@@ -403,9 +431,11 @@ impl WindowHelper {
             for i in 0..devices.GetCount()? {
                 let device = devices.Item(i)?;
 
-                match self.connect_airpods_device(device) {
-                    Ok(()) => break,
-                    Err(_) => {}
+                if let Ok(name) = get_name(&device)
+                    && name.to_lowercase().contains("airpods")
+                    && self.connect_airpods_device(device).is_ok()
+                {
+                    break;
                 }
             }
         }
@@ -450,20 +480,15 @@ impl WindowHelper {
 
     fn update_devices(&mut self) -> Result<()> {
         unsafe {
-            let device = self
-                .audio
-                .device_enumerator
-                .GetDevice(AIRPODS_AUDIO_DEVICE)?;
+            let airpods = self.find_connected_airpods()?;
+            let previous = std::mem::replace(&mut self.airpods_available, airpods.is_some());
 
-            let state = device.GetState()?;
-
-            let airpods_available = state == DEVICE_STATE_ACTIVE;
-
-            if airpods_available && !self.airpods_available {
-                self.audio.set_default_device(AIRPODS_AUDIO_DEVICE)?;
+            if let Some(airpods) = airpods
+                && !previous
+            {
+                let str = airpods.GetId()?;
+                self.audio.set_default_device(PCWSTR(str.0))?;
             }
-
-            self.airpods_available = airpods_available;
         }
 
         Ok(())
@@ -875,7 +900,7 @@ fn run() -> Result<()> {
             loop {
                 redraw_handle.redraw();
 
-                std::thread::sleep(Duration::from_secs(30));
+                std::thread::sleep(Duration::from_secs(5));
             }
         });
 
