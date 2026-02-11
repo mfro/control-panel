@@ -24,7 +24,7 @@ use windows::{
         },
         Media::{
             Audio::{
-                DEVICE_STATE, DEVICE_STATE_ACTIVE, EDataFlow, ERole,
+                DEVICE_STATE, DEVICE_STATE_ACTIVE, DEVICE_STATEMASK_ALL, EDataFlow, ERole,
                 Endpoints::{
                     IAudioEndpointVolume, IAudioEndpointVolumeCallback,
                     IAudioEndpointVolumeCallback_Impl,
@@ -213,7 +213,7 @@ impl AudioManager {
             let id = device.GetId()?.to_string()?;
 
             if !self.devices.contains_key(&id) {
-                let name: String = props.GetValue(&PKEY_Device_FriendlyName)?.to_string();
+                let name = props.GetValue(&PKEY_Device_FriendlyName)?.to_string();
                 let icon_path = props.GetValue(&PKEY_DeviceClass_IconPath)?.to_string();
                 let icon = load_icon(&icon_path).context(icon_path)?;
 
@@ -395,20 +395,35 @@ impl WindowHelper {
 
     fn connect_airpods(&mut self) -> Result<()> {
         unsafe {
-            let airpods_audio_device = self
+            let devices = self
                 .audio
                 .device_enumerator
-                .GetDevice(AIRPODS_AUDIO_DEVICE)?;
-            let topology: IDeviceTopology = airpods_audio_device.Activate(CLSCTX_ALL, None)?;
-            assert_eq!(1, topology.GetConnectorCount()?);
-            let connector = topology.GetConnector(0)?;
-            let airpods_bluetooth_device = connector.GetDeviceIdConnectedTo()?;
-            let airpods_bluetooth_device = self
-                .audio
-                .device_enumerator
-                .GetDevice(airpods_bluetooth_device)?;
+                .EnumAudioEndpoints(eRender, DEVICE_STATE(DEVICE_STATEMASK_ALL))?;
 
-            let control: IKsControl = airpods_bluetooth_device.Activate(CLSCTX_ALL, None)?;
+            for i in 0..devices.GetCount()? {
+                let device = devices.Item(i)?;
+
+                match self.connect_airpods_device(device) {
+                    Ok(()) => break,
+                    Err(_) => {}
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    fn connect_airpods_device(&mut self, device: IMMDevice) -> Result<()> {
+        unsafe {
+            let topology: IDeviceTopology = device.Activate(CLSCTX_ALL, None)?;
+            assert_eq!(1, topology.GetConnectorCount()?);
+
+            let connector = topology.GetConnector(0)?;
+
+            let bluetooth_device = connector.GetDeviceIdConnectedTo()?;
+            let bluetooth_device = self.audio.device_enumerator.GetDevice(bluetooth_device)?;
+
+            let control: IKsControl = bluetooth_device.Activate(CLSCTX_ALL, None)?;
 
             let property = KSIDENTIFIER {
                 Anonymous: KSIDENTIFIER_0 {
