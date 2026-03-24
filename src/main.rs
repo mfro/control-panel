@@ -1,7 +1,13 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 use std::{
-    cell::RefCell, collections::HashMap, ffi::CString, ptr::null_mut, str::FromStr, sync::Mutex,
+    cell::RefCell,
+    collections::HashMap,
+    ffi::{CString, OsString},
+    os::windows::ffi::OsStrExt,
+    ptr::null_mut,
+    str::FromStr,
+    sync::Mutex,
     time::Duration,
 };
 
@@ -17,9 +23,11 @@ use windows::{
                 CreateCompatibleDC, DeleteDC, DeleteObject, GetDC, InvalidateRect, SelectObject,
             },
             GdiPlus::{
-                GdipCreateFromHDC, GdipCreatePen1, GdipDrawLine, GdipSetPenEndCap,
-                GdipSetPenStartCap, GdiplusStartup, GdiplusStartupInput, LineCapTriangle,
-                UnitPixel,
+                FontStyleRegular, GdipCreateFont, GdipCreateFontFamilyFromName, GdipCreateFromHDC,
+                GdipCreatePen1, GdipCreateSolidFill, GdipCreateStringFormat, GdipDrawLine,
+                GdipDrawString, GdipMeasureString, GdipSetPenEndCap, GdipSetPenStartCap,
+                GdipSetTextRenderingHint, GdiplusStartup, GdiplusStartupInput, LineCapSquare,
+                LineCapTriangle, RectF, TextRenderingHintAntiAlias, UnitPixel,
             },
         },
         Media::{
@@ -46,20 +54,20 @@ use windows::{
         UI::{
             Shell::ExtractIconExA,
             WindowsAndMessaging::{
-                DefWindowProcA, DestroyIcon, DestroyWindow, DispatchMessageA, DrawIcon,
-                GetMessageA, GetWindowRect, HICON, HWND_DESKTOP, HWND_TOPMOST, IDC_ARROW,
+                CloseWindow, DefWindowProcA, DestroyIcon, DestroyWindow, DispatchMessageA,
+                DrawIcon, GetMessageA, GetWindowRect, HICON, HWND_DESKTOP, HWND_TOPMOST, IDC_ARROW,
                 LoadCursorW, MSG, PostQuitMessage, RegisterClassA, SWP_NOMOVE, SWP_NOSIZE,
                 SendMessageA, SetWindowPos, ULW_ALPHA, UpdateLayeredWindow, WM_DESTROY,
-                WM_DEVICECHANGE, WM_KILLFOCUS, WM_LBUTTONDOWN, WM_PAINT, WM_QUIT,
-                WM_WINDOWPOSCHANGING, WM_WTSSESSION_CHANGE, WNDCLASSA, WS_EX_LAYERED,
-                WS_EX_NOACTIVATE, WS_EX_TOPMOST, WS_POPUP, WS_VISIBLE, WTS_SESSION_LOCK,
-                WTS_SESSION_UNLOCK,
+                WM_DEVICECHANGE, WM_KILLFOCUS, WM_LBUTTONDOWN, WM_MOUSEWHEEL, WM_PAINT, WM_QUIT,
+                WM_RBUTTONDOWN, WM_WINDOWPOSCHANGING, WM_WTSSESSION_CHANGE, WNDCLASSA,
+                WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOPMOST, WS_POPUP, WS_VISIBLE,
+                WTS_SESSION_LOCK, WTS_SESSION_UNLOCK,
             },
         },
     },
     core::implement,
 };
-use windows_core::{PCSTR, PCWSTR, s};
+use windows_core::{PCSTR, PCWSTR, s, w};
 
 mod interop;
 use interop::*;
@@ -125,6 +133,21 @@ struct AudioDevice {
 impl AudioDevice {
     pub fn new(controls: IAudioEndpointVolume, icon: HICON) -> Self {
         Self { controls, icon }
+    }
+
+    pub fn volume(&self) -> Result<f32> {
+        unsafe {
+            let volume = self.controls.GetMasterVolumeLevelScalar()?;
+            Ok(volume)
+            // let mut min = 0.0;
+            // let mut max = 0.0;
+            // let mut increment = 0.0;
+            // self.controls
+            //     .GetVolumeRange(&mut min, &mut max, &mut increment)?;
+            // let value = (volume - min) / (max - min);
+
+            // return Ok(value);
+        }
     }
 
     pub fn is_mute(&self) -> Result<bool> {
@@ -302,10 +325,10 @@ impl WindowHelper {
             let bitmap = CreateCompatibleBitmap(screen, size.cx, size.cy);
             let _ = DeleteObject(SelectObject(dc, bitmap.into()));
 
-            let mut graphics = std::ptr::null_mut();
+            let mut graphics = default();
             GdipCreateFromHDC(dc, &mut graphics);
 
-            let mut pen = std::ptr::null_mut();
+            let mut pen = default();
             GdipCreatePen1(0xffff0000, 8.0, UnitPixel, &mut pen);
             GdipSetPenEndCap(pen, LineCapTriangle);
             GdipSetPenStartCap(pen, LineCapTriangle);
@@ -313,19 +336,95 @@ impl WindowHelper {
             let output = self.audio.get_default_device(eRender)?;
             let output = self.audio.get_device(&output)?;
 
-            DrawIcon(dc, 8, 8, output.icon)?;
+            let x = 100.0;
+
+            let string = format!("{:.0}%", output.volume()? * 100.0);
+            let string: Vec<_> = OsString::from(string).encode_wide().collect();
+
+            {
+                let mut brush = default();
+                let mut font_family = default();
+                let mut font = default();
+                let mut format = default();
+
+                GdipCreateSolidFill(0xff202020, &mut brush);
+                GdipCreateFontFamilyFromName(w!("Segoe UI"), default(), &mut font_family);
+                GdipCreateFont(font_family, 24.0, FontStyleRegular.0, UnitPixel, &mut font);
+                GdipCreateStringFormat(0, 0, &mut format);
+
+                GdipSetTextRenderingHint(graphics, TextRenderingHintAntiAlias);
+
+                let rect = RectF {
+                    X: x,
+                    Y: 8.0,
+                    Width: 1000.0,
+                    Height: 1000.0,
+                };
+
+                let mut bounds = default();
+                let mut chars = 0;
+                let mut lines = 0;
+                GdipMeasureString(
+                    graphics,
+                    PCWSTR(&string[0]),
+                    string.len() as _,
+                    font,
+                    &rect,
+                    format,
+                    &mut bounds,
+                    &mut chars,
+                    &mut lines,
+                );
+
+                let rect = RectF {
+                    X: x - bounds.Width,
+                    Y: 24.0 - bounds.Height / 2.0,
+                    ..rect
+                };
+
+                GdipDrawString(
+                    graphics,
+                    PCWSTR(&string[0]),
+                    string.len() as _,
+                    font,
+                    &rect,
+                    format,
+                    brush as _,
+                );
+            }
+
+            {
+                let mut pen = default();
+                GdipCreatePen1(0xffc0c0c0, 8.0, UnitPixel, &mut pen);
+                GdipSetPenEndCap(pen, LineCapSquare);
+                GdipSetPenStartCap(pen, LineCapSquare);
+                GdipDrawLine(graphics, pen, x + 4.0, 10.0, x + 4.0, 39.0);
+
+                let volume = output.volume()?;
+                let start = 39.0 - (29.0 * volume);
+
+                let mut pen = default();
+                GdipCreatePen1(0xff404040, 8.0, UnitPixel, &mut pen);
+                GdipSetPenEndCap(pen, LineCapSquare);
+                GdipSetPenStartCap(pen, LineCapSquare);
+                GdipDrawLine(graphics, pen, x + 4.0, start, x + 4.0, 39.0);
+            }
+
+            let x = x + 5.0;
+            DrawIcon(dc, x as i32 + 8, 8, output.icon)?;
             if output.is_mute()? {
-                GdipDrawLine(graphics, pen, 8.0, 8.0, 40.0, 40.0);
-                GdipDrawLine(graphics, pen, 40.0, 8.0, 8.0, 40.0);
+                GdipDrawLine(graphics, pen, x + 8.0, 8.0, x + 40.0, 40.0);
+                GdipDrawLine(graphics, pen, x + 40.0, 8.0, x + 8.0, 40.0);
             }
 
             let input = self.audio.get_default_device(eCapture)?;
             let input = self.audio.get_device(&input)?;
 
-            DrawIcon(dc, 48, 8, input.icon)?;
+            let x = x + 40.0;
+            DrawIcon(dc, x as i32 + 8, 8, input.icon)?;
             if input.is_mute()? {
-                GdipDrawLine(graphics, pen, 48.0, 8.0, 80.0, 40.0);
-                GdipDrawLine(graphics, pen, 80.0, 8.0, 48.0, 40.0);
+                GdipDrawLine(graphics, pen, x + 8.0, 8.0, x + 40.0, 40.0);
+                GdipDrawLine(graphics, pen, x + 40.0, 8.0, x + 8.0, 40.0);
             }
 
             let blend = BLENDFUNCTION {
@@ -395,6 +494,19 @@ impl WindowHelper {
             }
 
             self.unlock_mute_input = false;
+        }
+
+        Ok(())
+    }
+
+    fn step_volume(&mut self, up: bool) -> Result<()> {
+        let output = self.audio.get_default_device(eRender)?;
+        let device = self.audio.get_device(&output)?;
+
+        if up {
+            (unsafe { device.controls.VolumeStepUp(default()) })?;
+        } else {
+            (unsafe { device.controls.VolumeStepDown(default()) })?;
         }
 
         Ok(())
@@ -760,6 +872,17 @@ unsafe extern "system" fn window_proc(
                 wrap(|state| state.connect_airpods());
             }
 
+            WM_RBUTTONDOWN => {
+                CloseWindow(hwnd).unwrap();
+                DestroyWindow(hwnd).unwrap();
+            }
+
+            WM_MOUSEWHEEL => {
+                let value = ((wparam.0 >> 16) & 0xffff) as i16;
+                let up = value > 0;
+                wrap(|state| state.step_volume(up));
+            }
+
             WM_DEVICECHANGE => {
                 wrap(|state| state.update_devices());
             }
@@ -868,7 +991,7 @@ fn create_window() -> Result<HWND> {
             HWND_DESKTOP,
             default(),
             hinstance,
-            std::ptr::null(),
+            default(),
         );
 
         Ok(hwnd)
@@ -914,8 +1037,6 @@ fn run() -> Result<()> {
         let state = state.into_inner().unwrap();
 
         state.audio.destroy()?;
-
-        DestroyWindow(hwnd)?;
     }
 
     Ok(())
