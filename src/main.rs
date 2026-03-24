@@ -25,9 +25,9 @@ use windows::{
             GdiPlus::{
                 FontStyleRegular, GdipCreateFont, GdipCreateFontFamilyFromName, GdipCreateFromHDC,
                 GdipCreatePen1, GdipCreateSolidFill, GdipCreateStringFormat, GdipDrawLine,
-                GdipDrawString, GdipMeasureString, GdipSetPenEndCap, GdipSetPenStartCap,
-                GdipSetTextRenderingHint, GdiplusStartup, GdiplusStartupInput, LineCapSquare,
-                LineCapTriangle, RectF, TextRenderingHintAntiAlias, UnitPixel,
+                GdipDrawString, GdipFillRectangle, GdipMeasureString, GdipSetPenEndCap,
+                GdipSetPenStartCap, GdipSetTextRenderingHint, GdiplusStartup, GdiplusStartupInput,
+                LineCapSquare, LineCapTriangle, RectF, TextRenderingHintAntiAlias, UnitPixel,
             },
         },
         Media::{
@@ -327,6 +327,12 @@ impl WindowHelper {
 
             let mut graphics = default();
             GdipCreateFromHDC(dc, &mut graphics);
+
+            {
+                let mut brush = default();
+                GdipCreateSolidFill(0x01000000, &mut brush);
+                GdipFillRectangle(graphics, brush as _, 0.0, 0.0, size.cx as _, size.cy as _);
+            }
 
             let mut pen = default();
             GdipCreatePen1(0xffff0000, 8.0, UnitPixel, &mut pen);
