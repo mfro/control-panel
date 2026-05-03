@@ -78,12 +78,15 @@ fn default<T: Default>() -> T {
 
 #[cfg(not(debug_assertions))]
 fn log_to_file(str: &str) {
-    use std::{fs::File, io::Write};
+    use std::{fs::File, io::Write, path::Path};
+
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+
     let mut file = File::options()
         .write(true)
         .append(true)
         .create(true)
-        .open(r"E:\persistent\code\control-panel\log.txt")
+        .open(root.join("log.txt"))
         .unwrap();
 
     file.write_all(str.as_bytes()).unwrap();
@@ -139,14 +142,6 @@ impl AudioDevice {
         unsafe {
             let volume = self.controls.GetMasterVolumeLevelScalar()?;
             Ok(volume)
-            // let mut min = 0.0;
-            // let mut max = 0.0;
-            // let mut increment = 0.0;
-            // self.controls
-            //     .GetVolumeRange(&mut min, &mut max, &mut increment)?;
-            // let value = (volume - min) / (max - min);
-
-            // return Ok(value);
         }
     }
 
