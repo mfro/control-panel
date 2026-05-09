@@ -72,6 +72,8 @@ use windows_core::{PCSTR, PCWSTR, s, w};
 mod interop;
 use interop::*;
 
+mod clip;
+
 fn default<T: Default>() -> T {
     Default::default()
 }
@@ -1006,6 +1008,7 @@ fn run() -> Result<()> {
         initialize_gdip();
 
         let hwnd = create_window()?;
+        clip::spawn(hwnd);
 
         // register for WM_WTSSESSION_CHANGE events
         WTSRegisterSessionNotification(hwnd, NOTIFY_FOR_ALL_SESSIONS)?;
@@ -1020,13 +1023,7 @@ fn run() -> Result<()> {
             unlock_mute_output: false,
         })));
 
-        std::thread::spawn(move || {
-            loop {
-                redraw_handle.redraw();
-
-                std::thread::sleep(Duration::from_secs(5));
-            }
-        });
+        redraw_handle.redraw();
 
         let mut message = MSG::default();
 
