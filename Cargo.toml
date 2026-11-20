@@ -29,4 +29,5 @@ features = [
   "Win32_System_Variant",
   "Win32_UI_Shell_PropertiesSystem",
   "Win32_UI_WindowsAndMessaging",
+  "Win32_UI_Accessibility",
 ]

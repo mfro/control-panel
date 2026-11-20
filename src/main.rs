@@ -1,7 +1,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 use std::{
-    cell::RefCell,
+    cell::{Cell, RefCell},
     collections::HashMap,
     ffi::{CString, OsString},
     os::windows::ffi::OsStrExt,
@@ -52,14 +52,16 @@ use windows::{
             RemoteDesktop::{NOTIFY_FOR_ALL_SESSIONS, WTSRegisterSessionNotification},
         },
         UI::{
+            Accessibility::{HWINEVENTHOOK, SetWinEventHook, UnhookWinEvent},
             Shell::ExtractIconExA,
             WindowsAndMessaging::{
                 CloseWindow, DefWindowProcA, DestroyIcon, DestroyWindow, DispatchMessageA,
-                DrawIcon, GetMessageA, GetWindowRect, HICON, HWND_DESKTOP, HWND_TOPMOST, IDC_ARROW,
-                LoadCursorW, MSG, PostQuitMessage, RegisterClassA, SWP_NOMOVE, SWP_NOSIZE,
-                SendMessageA, SetWindowPos, ULW_ALPHA, UpdateLayeredWindow, WM_DESTROY,
-                WM_DEVICECHANGE, WM_KILLFOCUS, WM_LBUTTONDOWN, WM_MOUSEWHEEL, WM_PAINT, WM_QUIT,
-                WM_RBUTTONDOWN, WM_WINDOWPOSCHANGING, WM_WTSSESSION_CHANGE, WNDCLASSA,
+                DrawIcon, EVENT_OBJECT_LOCATIONCHANGE, EVENT_SYSTEM_FOREGROUND, GetMessageA,
+                GetWindowRect, HICON, HWND_DESKTOP, HWND_TOPMOST, IDC_ARROW, LoadCursorW, MSG,
+                PostQuitMessage, RegisterClassA, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE,
+                SendMessageA, SetWindowPos, ULW_ALPHA, UpdateLayeredWindow, WINEVENT_OUTOFCONTEXT,
+                WM_DESTROY, WM_DEVICECHANGE, WM_KILLFOCUS, WM_LBUTTONDOWN, WM_MOUSEWHEEL, WM_PAINT,
+                WM_QUIT, WM_RBUTTONDOWN, WM_WINDOWPOSCHANGING, WM_WTSSESSION_CHANGE, WNDCLASSA,
                 WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOPMOST, WS_POPUP, WS_VISIBLE,
                 WTS_SESSION_LOCK, WTS_SESSION_UNLOCK,
             },
@@ -833,6 +835,7 @@ fn message_name(event: u32) -> &'static str {
 
 thread_local! {
     static WINDOW_HELPER: RefCell<Option<Mutex<WindowHelper>>> = RefCell::new(None);
+    static REDRAW_HANDLE: Cell<Option<RedrawHandle>> = Cell::new(None)
 }
 
 unsafe extern "system" fn window_proc(
@@ -857,7 +860,7 @@ unsafe extern "system" fn window_proc(
                     0,
                     0,
                     0,
-                    SWP_NOMOVE | SWP_NOSIZE,
+                    SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
                 )
                 .unwrap();
             }
@@ -897,6 +900,39 @@ unsafe extern "system" fn window_proc(
         }
 
         DefWindowProcA(hwnd, event, wparam, lparam)
+    }
+}
+
+unsafe extern "system" fn window_event_proc(
+    _hwineventhook: HWINEVENTHOOK,
+    _event: u32,
+    hwnd: HWND,
+    _idobject: i32,
+    _idchild: i32,
+    _ideventthread: u32,
+    _dwmseventtime: u32,
+) {
+    unsafe {
+        if let Some(redraw) = REDRAW_HANDLE.get()
+            && hwnd == redraw.hwnd
+        {
+            let x = SetWindowPos(
+                hwnd,
+                Some(HWND_TOPMOST),
+                0,
+                0,
+                0,
+                0,
+                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+            );
+            log!(
+                "event proc: {:?} {} {:?} {:?}",
+                _hwineventhook,
+                _event,
+                hwnd,
+                x
+            );
+        }
     }
 }
 
@@ -1023,13 +1059,27 @@ fn run() -> Result<()> {
             unlock_mute_output: false,
         })));
 
+        REDRAW_HANDLE.replace(Some(redraw_handle));
+
         redraw_handle.redraw();
+
+        let hook = SetWinEventHook(
+            EVENT_SYSTEM_FOREGROUND,
+            EVENT_OBJECT_LOCATIONCHANGE,
+            None,
+            Some(window_event_proc),
+            0,
+            0,
+            WINEVENT_OUTOFCONTEXT,
+        );
 
         let mut message = MSG::default();
 
         while GetMessageA(&mut message, None, 0, 0).into() {
             DispatchMessageA(&message);
         }
+
+        UnhookWinEvent(hook).ok()?;
 
         let state = WINDOW_HELPER.take().context("state missing")?;
         let state = state.into_inner().unwrap();
@@ -1041,6 +1091,7 @@ fn run() -> Result<()> {
 }
 
 fn main() {
+    unsafe { std::env::set_var("RUST_BACKTRACE", "1") };
     loop {
         match run() {
             Ok(()) => break,
